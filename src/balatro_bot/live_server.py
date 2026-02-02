@@ -20,6 +20,7 @@ from .models import Card, Suit, Rank, Joker, GameState, HandType
 from .heuristics import HeuristicPlayer, evaluate_plays, get_best_play
 from .hand_evaluation import evaluate_hand, find_best_hand
 from .scoring import calculate_score
+from .jokers import create_joker, JokerInstance
 
 logger = logging.getLogger(__name__)
 
@@ -542,8 +543,55 @@ class LiveDecisionEngine:
                     best_indices.append(i)
                     break
 
-        # Calculate expected score
-        best_score = hand_result.base_chips * hand_result.base_mult if hand_result else 0
+        # Convert jokers to JokerInstances for scoring
+        joker_instances = []
+        for lj in state.jokers:
+            # Try different ID formats: raw, without j_ prefix, normalized
+            joker_id = lj.id
+            normalized_id = joker_id.lower().replace(" ", "_").replace("-", "_")
+            if normalized_id.startswith("j_"):
+                normalized_id = normalized_id[2:]
+
+            for try_id in [joker_id, normalized_id]:
+                try:
+                    joker_inst = create_joker(try_id)
+                    joker_inst.state = lj.state.copy() if lj.state else {}
+                    joker_instances.append(joker_inst)
+                    logger.info(f"Loaded joker: {lj.name} (id={try_id})")
+                    break
+                except ValueError:
+                    continue
+            else:
+                logger.warning(f"Unknown joker ID: {lj.id} (normalized: {normalized_id}), skipping")
+
+        # Create minimal game state for scoring
+        game_state = GameState(
+            hand=cards,
+            hand_levels=state.hand_levels.copy() if state.hand_levels else {},
+            ante=state.ante,
+            hands_remaining=state.hands_remaining,
+            discards_remaining=state.discards_remaining,
+        )
+
+        # Calculate score with joker effects
+        remaining_cards = [c for i, c in enumerate(cards) if i not in best_indices]
+        breakdown = calculate_score(
+            played_cards=best_cards,
+            jokers=joker_instances,
+            game_state=game_state,
+            cards_in_hand=remaining_cards,
+        )
+        best_score = breakdown.final_score
+
+        # Log scoring details
+        if joker_instances:
+            joker_names = [j.name for j in joker_instances]
+            logger.info(f"Scoring: base={breakdown.base_chips}x{breakdown.base_mult}, "
+                       f"final={breakdown.final_chips}x{breakdown.final_mult}={best_score}, "
+                       f"jokers={joker_names}")
+            if breakdown.joker_effects:
+                for je in breakdown.joker_effects:
+                    logger.info(f"  Joker effect: {je}")
 
         # Consider discarding if hand is weak and we have discards
         if state.discards_remaining > 0 and state.hands_remaining > 1:
