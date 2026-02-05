@@ -355,6 +355,9 @@ local function extract_deck_info()
         cards_in_hand = 0,
         cards_in_discard = 0,
         nines_in_deck = 0,  -- For Cloud 9
+        -- Actual card compositions for probability calculations
+        deck_cards = {},     -- Cards remaining in deck
+        discard_cards = {},  -- Cards in discard pile
     }
 
     if G and G.GAME and G.GAME.selected_back then
@@ -365,10 +368,16 @@ local function extract_deck_info()
     if G then
         if G.deck and G.deck.cards then
             info.cards_in_deck = #G.deck.cards
-            -- Count 9s for Cloud 9
+            -- Extract actual deck composition (simplified: suit + rank only)
             for _, card in ipairs(G.deck.cards) do
-                if card.base and card.base.id == 9 then
-                    info.nines_in_deck = info.nines_in_deck + 1
+                if card.base then
+                    table.insert(info.deck_cards, {
+                        suit = card.base.suit,
+                        rank = card.base.id,
+                    })
+                    if card.base.id == 9 then
+                        info.nines_in_deck = info.nines_in_deck + 1
+                    end
                 end
             end
         end
@@ -385,10 +394,16 @@ local function extract_deck_info()
 
         if G.discard and G.discard.cards then
             info.cards_in_discard = #G.discard.cards
-            -- And in discard
+            -- Extract discard pile composition
             for _, card in ipairs(G.discard.cards) do
-                if card.base and card.base.id == 9 then
-                    info.nines_in_deck = info.nines_in_deck + 1
+                if card.base then
+                    table.insert(info.discard_cards, {
+                        suit = card.base.suit,
+                        rank = card.base.id,
+                    })
+                    if card.base.id == 9 then
+                        info.nines_in_deck = info.nines_in_deck + 1
+                    end
                 end
             end
         end

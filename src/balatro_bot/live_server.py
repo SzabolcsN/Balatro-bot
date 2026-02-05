@@ -21,6 +21,8 @@ from .heuristics import HeuristicPlayer, evaluate_plays, get_best_play
 from .hand_evaluation import evaluate_hand, find_best_hand
 from .scoring import calculate_score
 from .jokers import create_joker, JokerInstance
+from .decision_engine import DeepDecisionEngine, DecisionConfig
+from .deck_tracker import DeckState
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +169,8 @@ class LiveGameState:
     cards_in_discard: int = 0
     nines_in_deck: int = 4  # For Cloud 9
     deck_name: Optional[str] = None
+    deck_cards: list[tuple[str, int]] = field(default_factory=list)  # (suit, rank) tuples
+    discard_cards: list[tuple[str, int]] = field(default_factory=list)  # (suit, rank) tuples
 
     # Jokers
     jokers: list[LiveJoker] = field(default_factory=list)
@@ -302,6 +306,8 @@ class LiveGameState:
             cards_in_discard=deck_info.get("cards_in_discard", 0),
             nines_in_deck=deck_info.get("nines_in_deck", 4),
             deck_name=deck_info.get("deck_name"),
+            deck_cards=[(c.get("suit", "Spades"), c.get("rank", 2)) for c in deck_info.get("deck_cards", [])],
+            discard_cards=[(c.get("suit", "Spades"), c.get("rank", 2)) for c in deck_info.get("discard_cards", [])],
             jokers=jokers,
             consumables=data.get("consumables", []),
             blind=blind,
@@ -519,33 +525,70 @@ class LiveDecisionEngine:
         return discard_indices, full_reason
 
     def _decide_hand(self, state: LiveGameState) -> Action:
-        """Decide which cards to play or discard."""
+        """Decide which cards to play or discard using deep decision engine."""
         cards = [card.to_model_card() for card in state.hand]
 
         if not cards:
             return Action(action_type="wait", reasoning="No cards in hand")
 
-        # Find best hand
-        best_cards, hand_result = find_best_hand(cards)
-        if not best_cards or not hand_result:
+        # Convert jokers to JokerInstances
+        joker_instances = self._convert_jokers(state.jokers)
+
+        # Create game state for scoring
+        game_state = GameState(
+            hand=cards,
+            hand_levels=state.hand_levels.copy() if state.hand_levels else {},
+            ante=state.ante,
+            hands_remaining=state.hands_remaining,
+            discards_remaining=state.discards_remaining,
+        )
+
+        # Create deck state from actual deck composition if available
+        deck_state = self._create_deck_state(state, cards)
+
+        # Get blind info
+        blind_chips = state.blind.chips_required if state.blind else 300
+        current_chips = state.blind.chips_scored if state.blind else 0
+        is_boss = state.blind.blind_type == "Boss" if state.blind else False
+
+        # Use deep decision engine
+        engine = DeepDecisionEngine()
+        decision = engine.decide(
+            hand=cards,
+            jokers=joker_instances,
+            game_state=game_state,
+            blind_chips=blind_chips,
+            current_chips=current_chips,
+            hands_remaining=state.hands_remaining,
+            discards_remaining=state.discards_remaining,
+            deck_state=deck_state,
+            is_boss_blind=is_boss,
+        )
+
+        # Convert decision to Action
+        card_names = [str(cards[i]) for i in decision.card_indices]
+        reasoning_str = ", ".join(decision.reasoning)
+
+        if decision.action_type == "discard":
+            return Action(
+                action_type="discard",
+                card_indices=decision.card_indices,
+                confidence=0.7,
+                reasoning=f"DISCARD: {', '.join(card_names)} | {reasoning_str}"
+            )
+        else:
+            hand_name = decision.hand_type.name if decision.hand_type else "UNKNOWN"
             return Action(
                 action_type="play",
-                card_indices=[0],
-                confidence=0.1,
-                reasoning="No valid hand found, playing first card"
+                card_indices=decision.card_indices,
+                confidence=min(1.0, decision.expected_score / 1000),
+                reasoning=f"{hand_name} ({', '.join(card_names)}) ~{decision.expected_score} chips | {reasoning_str}"
             )
 
-        # Get indices of cards in best hand
-        best_indices = []
-        for bc in best_cards:
-            for i, c in enumerate(cards):
-                if c.rank == bc.rank and c.suit == bc.suit and i not in best_indices:
-                    best_indices.append(i)
-                    break
-
-        # Convert jokers to JokerInstances for scoring
+    def _convert_jokers(self, live_jokers: list) -> list[JokerInstance]:
+        """Convert LiveJoker objects to JokerInstance objects."""
         joker_instances = []
-        for lj in state.jokers:
+        for lj in live_jokers:
             # Try different ID formats: raw, without j_ prefix, normalized
             joker_id = lj.id
             normalized_id = joker_id.lower().replace(" ", "_").replace("-", "_")
@@ -557,73 +600,60 @@ class LiveDecisionEngine:
                     joker_inst = create_joker(try_id)
                     joker_inst.state = lj.state.copy() if lj.state else {}
                     joker_instances.append(joker_inst)
-                    logger.info(f"Loaded joker: {lj.name} (id={try_id})")
+                    logger.debug(f"Loaded joker: {lj.name} (id={try_id})")
                     break
                 except ValueError:
                     continue
             else:
                 logger.warning(f"Unknown joker ID: {lj.id} (normalized: {normalized_id}), skipping")
 
-        # Create minimal game state for scoring
-        game_state = GameState(
-            hand=cards,
-            hand_levels=state.hand_levels.copy() if state.hand_levels else {},
-            ante=state.ante,
-            hands_remaining=state.hands_remaining,
-            discards_remaining=state.discards_remaining,
-        )
+        return joker_instances
 
-        # Calculate score with joker effects
-        remaining_cards = [c for i, c in enumerate(cards) if i not in best_indices]
-        breakdown = calculate_score(
-            played_cards=best_cards,
-            jokers=joker_instances,
-            game_state=game_state,
-            cards_in_hand=remaining_cards,
-        )
-        best_score = breakdown.final_score
+    def _create_deck_state(self, state: LiveGameState, hand_cards: list[Card]) -> DeckState:
+        """Create DeckState from live game state.
 
-        # Log scoring details
-        if joker_instances:
-            joker_names = [j.name for j in joker_instances]
-            logger.info(f"Scoring: base={breakdown.base_chips}x{breakdown.base_mult}, "
-                       f"final={breakdown.final_chips}x{breakdown.final_mult}={best_score}, "
-                       f"jokers={joker_names}")
-            if breakdown.joker_effects:
-                for je in breakdown.joker_effects:
-                    logger.info(f"  Joker effect: {je}")
+        Uses actual deck composition if available from Lua mod,
+        otherwise falls back to inferring from known cards.
+        """
+        # Map suit strings to Suit enum
+        suit_map = {
+            "Spades": Suit.SPADES, "Hearts": Suit.HEARTS,
+            "Clubs": Suit.CLUBS, "Diamonds": Suit.DIAMONDS
+        }
 
-        # Consider discarding if hand is weak and we have discards
-        if state.discards_remaining > 0 and state.hands_remaining > 1:
-            weak_hands = (HandType.HIGH_CARD, HandType.PAIR, HandType.TWO_PAIR)
-            if hand_result and hand_result.hand_type in weak_hands:
-                discard_indices, discard_reason = self._decide_discard(
-                    cards, state, hand_result, best_indices
-                )
-                if discard_indices:
-                    return Action(
-                        action_type="discard",
-                        card_indices=discard_indices,
-                        confidence=0.6,
-                        reasoning=f"{hand_result.hand_type.name} | {discard_reason}"
-                    )
+        # Map rank IDs to Rank enum
+        rank_map = {
+            2: Rank.TWO, 3: Rank.THREE, 4: Rank.FOUR, 5: Rank.FIVE,
+            6: Rank.SIX, 7: Rank.SEVEN, 8: Rank.EIGHT, 9: Rank.NINE,
+            10: Rank.TEN, 11: Rank.JACK, 12: Rank.QUEEN,
+            13: Rank.KING, 14: Rank.ACE
+        }
 
-        # Play the best hand
-        if best_indices:
-            card_names = [str(cards[i]) for i in best_indices]
-            return Action(
-                action_type="play",
-                card_indices=best_indices,
-                confidence=min(1.0, best_score / 1000),
-                reasoning=f"{hand_result.hand_type.name} ({', '.join(card_names)}) ~{best_score} chips"
+        # If we have actual deck composition from Lua mod
+        if state.deck_cards:
+            remaining_cards = []
+            for suit_str, rank_id in state.deck_cards:
+                suit = suit_map.get(suit_str, Suit.SPADES)
+                rank = rank_map.get(rank_id, Rank.TWO)
+                remaining_cards.append(Card(rank=rank, suit=suit))
+
+            discarded = []
+            for suit_str, rank_id in state.discard_cards:
+                suit = suit_map.get(suit_str, Suit.SPADES)
+                rank = rank_map.get(rank_id, Rank.TWO)
+                discarded.append(Card(rank=rank, suit=suit))
+
+            logger.debug(f"Using actual deck composition: {len(remaining_cards)} in deck, {len(discarded)} discarded")
+
+            return DeckState(
+                remaining_cards=remaining_cards,
+                cards_played=[],  # We don't track played cards separately
+                cards_discarded=discarded,
             )
 
-        return Action(
-            action_type="play",
-            card_indices=[0],
-            confidence=0.1,
-            reasoning="No good options, playing first card"
-        )
+        # Fallback: infer from known cards (hand only)
+        logger.debug("No deck composition available, inferring from hand")
+        return DeckState.from_known_cards(hand_cards)
 
     def _decide_shop(self, state: LiveGameState) -> Action:
         """Decide what to buy in the shop."""
